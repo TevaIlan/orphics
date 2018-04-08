@@ -4,7 +4,7 @@ import numpy as np
 from enlib.fft import fft,ifft
 from scipy.interpolate import interp1d
 import yaml,six
-from orphics import io
+from orphics import io,cosmology,stats
 import math
 from scipy.interpolate import RectBivariateSpline,interp2d,interp1d
 
@@ -174,20 +174,56 @@ def rect_geometry(width_arcmin=None,width_deg=None,px_res_arcmin=0.5,proj="car",
     return shape, wcs
 
 
-def downsample_power(shape,wcs,cov,ndown=16,order=0,exp=None,fftshift=True,fft=False):
+def downsample_power(shape,wcs,cov,ndown=16,order=0,exp=None,fftshift=True,fft=False,logfunc=lambda x: x,ilogfunc=lambda x: x,fft_up=False):
+    """
+    Smooth a power spectrum by averaging. This can be used to, for example:
+    1. calculate a PS for use in a noise model
+    2. calculate an ILC covariance empirically in Fourier-Cartesian domains
+
+    shape -- tuple specifying shape of 
+    """
+
+    
+    ndown = np.array(ndown).ravel()
+    if ndown.size==1:
+        Ny,Nx = shape[-2:]
+        nmax = max(Ny,Nx)
+        nmin = min(Ny,Nx)
+        ndown1 = ndown[0]
+        ndown2 = int(ndown*nmax*1./nmin)
+        ndown = np.array((ndown2,ndown1)) if Ny>Nx else np.array((ndown1,ndown2))
+    else:
+        assert ndown.size==2
+        ndown = np.array((ndown[0],ndown[1]))
+    print("Downsampling power spectrum by factor ", ndown)
+        
+        
+    cov = logfunc(cov)
     afftshift = np.fft.fftshift if fftshift else lambda x: x
     aifftshift = np.fft.ifftshift if fftshift else lambda x: x
-    pix_high = enmap.pixmap(shape[-2:],wcs)
-    pix_low = pix_high/float(ndown)
     if fft:
-        cov_low = resample.resample_fft(afftshift(cov), [s/ndown for s in shape])
+        dshape = np.array(cov.shape)
+        dshape[-2] /= ndown[0]
+        dshape[-1] /= ndown[1]
+        cov_low = resample.resample_fft(afftshift(cov), dshape.astype(np.int))
     else:
         cov_low = enmap.downgrade(afftshift(cov), ndown)
+    if not(fft_up):
+        pix_high = enmap.pixmap(shape[-2:],wcs)
+        pix_low = pix_high/ndown.reshape((2,1,1))
+        
     if exp is not None:
         covexp = enmap.enmap(enmap.multi_pow(cov_low,exp),wcs)
     else:
         covexp = enmap.enmap(cov_low,wcs)
-    return aifftshift(covexp.at(pix_low, order=order, mask_nan=False, unit="pix"))
+
+
+    if fft_up:
+        retcov = resample.resample_fft(covexp, shape)
+    else:
+        retcov = covexp.at(pix_low, order=order, mask_nan=False, unit="pix")
+        
+    return ilogfunc(aifftshift(retcov))
     
 
 class MapGen(object):
@@ -496,6 +532,7 @@ def ncov(shape,wcs,noise_uk_arcmin):
     noise_uK_pixel = noise_uK_rad/normfact
     return np.diag([(noise_uK_pixel)**2.]*np.prod(shape))
 
+
 def pixcov(shape,wcs,fourier_cov):
     #fourier_cov = fourier_cov.astype(np.float32, copy=False)
     fourier_cov = fourier_cov.astype(np.complex64, copy=False)
@@ -516,6 +553,8 @@ def get_lnlike(covinv,instamp):
     ans = np.dot(np.dot(vec.T,covinv),vec)
     assert ans.size==1
     return ans[0,0]
+
+
 
 def pixcov_sim(shape,wcs,ps,Nsims,seed=None,mean_sub=True,pad=0):
     if pad>0:
@@ -740,6 +779,34 @@ def ilc_comb_a_b(response_a,response_b,cinv):
     pind = ilc_index(cinv.ndim) # either "p" or "ij" depending on whether we are dealing with 1d or 2d power
     return np.einsum('l,l'+pind+'->'+pind,response_a,np.einsum('k,kl'+pind+'->l'+pind,response_b,cinv))
 
+
+def ilc_empirical_cov(kmaps,bin_edges=None,ndown=16,order=1,fftshift=True,method="isotropic"):
+    assert method in ['isotropic','downsample']
+    
+    assert kmaps.ndim==3
+    ncomp = kmaps.shape[0]
+
+    if method=='isotropic':
+        modlmap = enmap.modlmap(kmaps[0].shape,kmaps.wcs)
+        binner = stats.bin2D(modlmap,bin_edges)
+        from scipy.interpolate import interp1d
+
+    
+    retpow = np.zeros((ncomp,ncomp,kmaps.shape[-2],kmaps.shape[-1]))
+    for i in range(ncomp):
+        for j in range(i+1,ncomp):
+            retpow[i,j] = np.real(kmaps[i]*kmaps[j].conj())
+            if method=='isotropic':
+                cents,p1d = binner.bin(retpow[i,j])
+                retpow[i,j] = interp1d(cents,p1d,fill_value="extrapolate",bounds_error=False)(modlmap)
+            retpow[j,i] = retpow[i,j].copy()
+
+    if method=='isotropic':
+        return retpow
+    elif method=='downsample':
+        return downsample_power(retpow.shape,kmaps[0].wcs,retpow,ndown=ndown,order=order,exp=None,fftshift=fftshift,fft=False,logfunc=lambda x: x,ilogfunc=lambda x: x,fft_up=False)
+
+
 def ilc_cov(ells,cmb_ps,kbeams,freqs,noises,components,fnoise,plot=False,plot_save=None,kmask=None):
     """
     ells -- either 1D or 2D fourier wavenumbers
@@ -761,7 +828,7 @@ def ilc_cov(ells,cmb_ps,kbeams,freqs,noises,components,fnoise,plot=False,plot_sa
         cshape = (nfreqs,nfreqs,1)
     else:
         raise ValueError
-    
+
     Covmat = np.tile(cmb_ps,cshape)
 
     if plot:
@@ -1660,9 +1727,9 @@ class SimoneMR2Reader(ACTMapReader):
     
     def __init__(self,map_root,beam_root,config_yaml_path,patch):
         ACTMapReader.__init__(self,map_root,beam_root,config_yaml_path)
-        eg_file = self._fstring(split=-1,season="s15",patch=patch,array="pa1",freq="150",day_night="night",pol="I")
-        self.shape,self.wcs = enmap.read_fits_geometry(eg_file)
         self.patch = patch
+        eg_file = self._fstring(split=-1,season="s15" if (patch=="deep56" or patch=="deep8") else "s13",array="pa1",freq="150",day_night="night",pol="I")
+        self.shape,self.wcs = enmap.read_fits_geometry(eg_file)
         
     def get_beam(self,season,array,freq="150",day_night="night"):
         patch = self.patch
@@ -1692,12 +1759,14 @@ class SimoneMR2Reader(ACTMapReader):
             return retval
         
 
-    def _fstring(self,split,season,patch,array,freq,day_night,pol):
+    def _fstring(self,split,season,array,freq,day_night,pol):
+        patch = self.patch
         # Change this function if the map naming scheme changes
         splitstr = "set0123" if split<0 or split>3 else "set"+str(split)
         return self.map_root+"c7v5/"+season+"/"+patch+"/"+season+"_mr2_"+patch+"_"+array+"_f"+freq+"_"+day_night+"_"+splitstr+"_wpoly_500_"+pol+".fits"
 
-    def _hstring(self,season,patch,array,freq,day_night):
+    def _hstring(self,season,array,freq,day_night):
+        patch = self.patch
         splitstr = "set0123"
         return self.map_root+"c7v5/"+season+"/"+patch+"/"+season+"_mr2_"+patch+"_"+array+"_f"+freq+"_"+day_night+"_"+splitstr+"_hits.fits"
 
@@ -2273,17 +2342,87 @@ class MultiArray(object):
 
     def __init__(self,shape,wcs,taper=None):
         self.flat_cmb_inited = False
-        pass
+        self.ngens = []
+        self.labels = []
+        self.freqs = []
+        self.beams = []
+        self.fgs = []
+        self.fgens = {}
+        self.ref_freqs = {}
+        self.freq_scale_func = {}
+        self.shape = shape
+        self.wcs = wcs
+        self.pol = True if len(shape[-3:])==3 else False
 
-    def add_array(self,label,freq_ghz,beam_arcmin=None,noise_uk_arcmin_T=None,noise_uk_arcmin_P=None,ps_noise=None,beam2d=None,beam_func=None):
-        pass
+    def add_array(self,label,freq_ghz,beam_arcmin=None,noise_uk_arcmin_T=None,noise_uk_arcmin_P=None,ps_noise=None,beam2d=None,beam_func=None,lknee_T=0,lknee_P=0,alpha_T=1,alpha_P=1,dimensionless=False):
+        
+        self.labels.append(label)
+        self.freqs.append(freq_ghz)
+        
+        modlmap = enmap.modlmap(self.shape,self.wcs)
+        if beam2d is None: beam2d = gauss_beam(modlmap,beam_arcmin)
+        
+        nT = cosmology.white_noise_with_atm_func(modlmap,noise_uk_arcmin_T,lknee_T,alpha_T,dimensionless)
+        Ny,Nx = modlmap.shape
+        if self.pol:
+            nP = cosmology.white_noise_with_atm_func(modlmap,noise_uk_arcmin_P,lknee_P,alpha_P,dimensionless)
+            ps_noise = np.zeros((3,3,Ny,Nx))
+            ps_noise[0,0] = nT
+            ps_noise[1,1] = nP
+            ps_noise[2,2] = nP
+        else:
+            ps_noise = np.zeros((1,1,Ny,Nx))
+            ps_noise[0,0] = nT
+            nP = 0
+
+        self.beams.append(beam2d)
+        ps_noise[:,:,modlmap<2] = 0
+        self.ngens.append( MapGen(self.shape,self.wcs,ps_noise) )
+        return np.nan_to_num(nT/beam2d**2.),np.nan_to_num(nP/beam2d**2.)
+        
 
     def get_full_sky_cmb_sim(self,sim_root,index):
         pass
 
     def init_flat_cmb_sim(self,ps_cmb,flat_lensing=False,fixed_kappa=None,buffer_deg=None):
         self.flat_cmb_inited = True
+        self.mgen = MapGen(self.shape,self.wcs,ps_cmb)
 
+    def add_gaussian_foreground(self,label,ps_fg,ref_freq,freq_scale_func):
+        self.fgens[label] = MapGen(self.shape,self.wcs,ps_fg)
+        self.ref_freqs[label] = ref_freq
+        self.freq_scale_func[label] = freq_scale_func
+        self.fgs.append(label)
+        
+    
+    def get_sky(self,foregrounds = None,cmb_seed=None,noise_seed=None,fg_seed=None,return_fg=False):
+        cmb = self.mgen.get_map(seed=cmb_seed)
+        foregrounds = self.fgs if foregrounds is None else foregrounds
+
+        observed = []
+        if return_fg: input_fg = []
+
+        fgmaps = {}
+        for foreground in foregrounds:
+            fgmaps[foreground] = self.fgens[foreground].get_map(seed=fg_seed)
+            
+        for i in range(len(self.labels)):
+            noise = self.ngens[i].get_map(seed=noise_seed)
+            freq = self.freqs[i]
+
+            fgs = 0.
+            for foreground in foregrounds:
+                fgs += fgmaps[foreground] * self.freq_scale_func[foreground](freq) / self.freq_scale_func[foreground](self.ref_freqs[foreground])
+
+            sky = filter_map(cmb + fgs,self.beams[i])
+            observed.append( sky + noise )
+            if return_fg: input_fg.append( fgs.copy() )
+            
+        if return_fg:
+            return np.stack(observed),np.stack(input_fg)
+        else:
+            return np.stack(observed)
+        
     def lens_cmb(self,imap,input_kappa=None):
         pass
 
@@ -2296,3 +2435,21 @@ class MultiArray(object):
     
     def get_noise_sim(self,label,pol=True,buffer_deg=None):
         pass
+
+
+    def fft_data(self,imaps,kmask=None):
+
+        kmask = np.ones(imaps.shape[-2:]) if kmask is None else kmask
+
+        retks = []
+        for i in range(len(self.labels)):
+            retk = np.nan_to_num(enmap.fft(imaps[i])*kmask/self.beams[i])
+            retk[kmask==0] = 0.
+            retks.append(retk)
+
+        return np.stack(retks)
+
+
+
+    
+        

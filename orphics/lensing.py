@@ -32,13 +32,14 @@ def lens_cov(ucov,alpha_pix,lens_order=5,kbeam=None,bshape=None):
 
     shape = alpha_pix.shape[-2:]
     Scov = ucov.copy()
+    wcs = ucov.wcs
     for i in range(ucov.shape[0]):
-        unlensed = Scov[i,:].copy().reshape(shape)
+        unlensed = enmap.enmap(Scov[i,:].copy().reshape(shape),wcs)
         lensed = enlensing.displace_map(unlensed, alpha_pix, order=lens_order)
         if kbeam is not None: lensed = maps.filter_map(lensed,kbeam)
         Scov[i,:] = lensed.ravel()
     for j in range(ucov.shape[1]):
-        unlensed = Scov[:,j].copy().reshape(shape)
+        unlensed = enmap.enmap(Scov[:,j].copy().reshape(shape),wcs)
         lensed = enlensing.displace_map(unlensed, alpha_pix, order=lens_order)
         if kbeam is not None: lensed = maps.filter_map(lensed,kbeam)
         Scov[:,j] = lensed.ravel()
@@ -193,8 +194,8 @@ class QuadNorm(object):
         self.fMaskXX = {}
         self.fMaskYY = {}
 
-        self.lmax_T=bigell #9000.
-        self.lmax_P=bigell #9000.
+        self.lmax_T=bigell
+        self.lmax_P=bigell
         self.defaultMaskT = maps.mask_kspace(self.shape,self.wcs,lmin=2,lmax=self.lmax_T)
         self.defaultMaskP = maps.mask_kspace(self.shape,self.wcs,lmin=2,lmax=self.lmax_P)
         #del lx
@@ -843,7 +844,7 @@ class NlGenerator(object):
 
         Clkk2d = theorySpectra.gCl("kk",self.N.modLMap)    
         self.N.addClkk2DPower(Clkk2d)
-            
+        self.N.bigell = bigell
 
         if bin_edges is not None:
             self.bin_edges = bin_edges
@@ -856,8 +857,8 @@ class NlGenerator(object):
 
     def updateNoiseAdvanced(self,beamTX,noiseTX,beamPX,noisePX,tellminX,tellmaxX,pellminX,pellmaxX,beamTY,noiseTY,beamPY,noisePY,tellminY,tellmaxY,pellminY,pellmaxY,lkneesX=[0,0],alphasX=[1,1],lkneesY=[0,0],alphasY=[1,1],lxcutTX=None,lxcutTY=None,lycutTX=None,lycutTY=None,lxcutPX=None,lxcutPY=None,lycutPX=None,lycutPY=None,fgFuncX=None,fgFuncY=None,beamFileTX=None,beamFilePX=None,beamFileTY=None,beamFilePY=None,noiseFuncTX=None,noiseFuncTY=None,noiseFuncPX=None,noiseFuncPY=None):
 
-        self.N.lmax_T = max(tellmaxX,tellmaxY)
-        self.N.lmax_P = max(pellmaxX,pellmaxY)
+        self.N.lmax_T = self.N.bigell
+        self.N.lmax_P = self.N.bigell
 
         lkneeTX, lkneePX = lkneesX
         lkneeTY, lkneePY = lkneesY
@@ -926,8 +927,8 @@ class NlGenerator(object):
         tellmaxY = setDefault(tellmaxY,tellmaxX)
         pellmaxY = setDefault(pellmaxY,pellmaxX)
 
-        self.N.lmax_T = max(tellmaxX,tellmaxY)
-        self.N.lmax_P = max(pellmaxX,pellmaxY)
+        self.N.lmax_T = self.N.bigell
+        self.N.lmax_P = self.N.bigell
 
         
         nTX,nPX = maps.whiteNoise2D([noiseTX,noisePX],beamX,self.N.modLMap, \
@@ -1650,11 +1651,13 @@ def NFWMatchedFilterSN(clusterCosmology,log10Moverh,c,z,ells,Nls,kellmax,overden
     kappaReal, r500 = NFWkappa(cc,M,c,z,modRMap*180.*60./np.pi,winAtLens,overdensity=overdensity,critical=critical,atClusterZ=atClusterZ)
     
     dAz = cc.results.angular_diameter_distance(z) * cc.h
+    # print ("daz " , dAz , " mpc")
+    # print ("r500 " , r500 , " mpc")
     th500 = r500/dAz
     #fiveth500 = 10.*np.pi/180./60. #5.*th500
     fiveth500 = 5.*th500
-    # print "5theta500 " , fiveth500*180.*60./np.pi , " arcminutes"
-    # print "maximum theta " , modRMap.max()*180.*60./np.pi, " arcminutes"
+    # print ("5theta500 " , fiveth500*180.*60./np.pi , " arcminutes")
+    # print ("maximum theta " , modRMap.max()*180.*60./np.pi, " arcminutes")
 
     kInt = kappaReal.copy()
     kInt[modRMap>fiveth500] = 0.
@@ -1775,7 +1778,6 @@ def NFWkappa(cc,massOverh,concentration,zL,thetaArc,winAtLens,overdensity=500.,c
         r500 = cc.rdel_c(M,zdensity,overdensity).flatten()[0] # R500 in Mpc/h
     else:
         r500 = cc.rdel_m(M,zdensity,overdensity) # R500 in Mpc/h
-
 
     conv=np.pi/(180.*60.)
     theta = thetaArc*conv # theta in radians
